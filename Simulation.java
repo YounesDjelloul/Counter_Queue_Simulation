@@ -1,9 +1,10 @@
 import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
 class CashCounter {
     protected Queue<Customer> customerQueue = new ArrayDeque<>();
-    private int totalCustomersProcessed = 0;
-    private int totalWaitingTime = 0;
+    private AtomicInteger totalCustomersProcessed = new AtomicInteger(0);
+    private AtomicInteger totalWaitingTime = new AtomicInteger(0);
     private int counterNumber;
 
     public CashCounter(int counterNumber) {
@@ -11,23 +12,18 @@ class CashCounter {
     }
 
     public synchronized void processCustomer(Customer customer) {
-        try {
-            Thread.sleep(customer.getProcessingTime() * 1000);
-            totalCustomersProcessed++;
-            totalWaitingTime += customer.getProcessingTime();
-            System.out.println("\n" + (customer instanceof ExpressCustomer ? "Express" : "Regular") +
-                    " Customer " + customer.getCustomerID() + " processed at Counter " + counterNumber);
-        } catch (InterruptedException e) {
-            e.printStackTrace();
-        }
+        totalCustomersProcessed.incrementAndGet();
+        totalWaitingTime.addAndGet(customer.getProcessingTime());
+        System.out.println("\n" + (customer instanceof ExpressCustomer ? "Express" : "Regular") +
+                " Customer " + customer.getCustomerID() + " processed at Counter " + counterNumber);
     }
 
     public int getTotalCustomersProcessed() {
-        return totalCustomersProcessed;
+        return totalCustomersProcessed.get();
     }
 
     public int getTotalWaitingTime() {
-        return totalWaitingTime;
+        return totalWaitingTime.get();
     }
 
     public int getCounterNumber() {
@@ -40,14 +36,14 @@ class CashCounter {
 }
 
 class Customer {
-    private static int customerCount = 0;
+    private static AtomicInteger customerCount = new AtomicInteger(0);
     private int customerID;
     private double arrivalTime;
     private int processingTime;
     private int itemsInCart;
 
     public Customer(double arrivalTime, int itemsInCart) {
-        this.customerID = ++customerCount;
+        this.customerID = customerCount.incrementAndGet();
         this.arrivalTime = arrivalTime;
         this.itemsInCart = itemsInCart;
         this.processingTime = calculateProcessingTime();
@@ -89,7 +85,7 @@ class ExpressCustomer extends Customer {
 public class Simulation {
     private static volatile boolean processing = true;
     private static int totalCustomers;
-    private static int customersArrived = 0;
+    private static AtomicInteger customersArrived = new AtomicInteger(0);
 
     public static void main(String[] args) {
         Scanner scanner = new Scanner(System.in);
@@ -133,13 +129,16 @@ public class Simulation {
                 regularCustomers.add(customer);
             }
 
-            currentTime += customerArrivalRate * 1000; // Update the current time for the next customer
+            currentTime += customerArrivalRate * 1000;
         }
 
         scanner.close();
 
-        Thread arrivalThread = new Thread(() -> printArrivals(counters, expressCustomers, regularCustomers, customerArrivalRate));
-        arrivalThread.start();
+        Thread arrivalExpressThread = new Thread(() -> printExpressArrivals(counters, expressCustomers, customerArrivalRate));
+        arrivalExpressThread.start();
+
+        Thread arrivalRegularThread = new Thread(() -> printRegularArrivals(counters, regularCustomers, customerArrivalRate));
+        arrivalRegularThread.start();
 
         Thread[] threads = new Thread[numCashCounters];
         for (int i = 0; i < numCashCounters; i++) {
@@ -149,7 +148,8 @@ public class Simulation {
         }
 
         try {
-            arrivalThread.join();
+            arrivalExpressThread.join();
+            arrivalRegularThread.join();
         } catch (InterruptedException e) {
             e.printStackTrace();
         }
@@ -166,30 +166,34 @@ public class Simulation {
 
         System.out.println("\nSimulation Reporting:\n");
         for (CashCounter counter : counters) {
-            double avgWaitingTime = counter.getTotalCustomersProcessed() != 0 ? counter.getTotalWaitingTime() / counter.getTotalCustomersProcessed() : 0;
+            double avgWaitingTime = counter.getTotalCustomersProcessed() != 0 ? (double) counter.getTotalWaitingTime() / counter.getTotalCustomersProcessed() : 0;
             System.out.printf("Counter %d: (%d) Customers Processed, Average Waiting Time - %.1f seconds%n",
                     counter.getCounterNumber(), counter.getTotalCustomersProcessed(), avgWaitingTime);
         }
     }
 
+
     private static void processCustomers(CashCounter counter, CashCounter[] counters) {
         int pullingRate = 100;
 
         while (true) {
-            synchronized (counter) {
-                if (!counter.customerQueue.isEmpty()) {
-                    Customer customer = counter.customerQueue.poll();
-                    counter.processCustomer(customer);
-                    counter.notify();  // Notify after processing a customer
-                } else {
-                    if (!processing && allQueuesEmpty(counters)) {
-                        break;
-                    }
-                    try {
-                        counter.wait(pullingRate);  // Wait for a short duration
-                    } catch (InterruptedException e) {
-                        e.printStackTrace();
-                    }
+            if (!counter.customerQueue.isEmpty()) {
+                Customer customer = counter.customerQueue.poll();
+                try {
+                    Thread.sleep(customer.getProcessingTime() * 1000);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+                counter.processCustomer(customer);
+            } else {
+                if (!processing && allQueuesEmpty(counters)) {
+                    break;
+                }
+
+                try {
+                    Thread.sleep(pullingRate);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
                 }
             }
         }
@@ -204,38 +208,18 @@ public class Simulation {
         return true;
     }
 
-
-    private static void printArrivals(CashCounter[] counters, List<Customer> expressCustomers, List<Customer> regularCustomers, int customerArrivalRate) {
+    private static void printExpressArrivals(CashCounter[] counters, List<Customer> expressCustomers, int customerArrivalRate) {
         long pauseDuration = customerArrivalRate * 1000;
-
-        // Start express customer threads
+    
+        // Print express arrivals
         for (Customer expressCustomer : expressCustomers) {
-            new Thread(() -> {
-                CashCounter expressCounter = counters[0]; // Counter 0 is reserved for express customers
-                synchronized (expressCounter) {
-                    expressCounter.customerQueue.add(expressCustomer);
-                    customersArrived++;
-                    System.out.println("\nExpress Customer " + expressCustomer.getCustomerID() + " arrived at Counter " + expressCounter.getCounterNumber());
-                }
-            }).start();
-        }
-
-        // Regular customers
-        for (Customer regularCustomer : regularCustomers) {
-            // Exclude Counter 0 (express counter) from the sort
-            CashCounter[] nonExpressCounters = Arrays.copyOfRange(counters, 1, counters.length);
-            Arrays.sort(nonExpressCounters, Comparator.comparingInt(c -> c.customerQueue.size()));
-
-            CashCounter shortestQueueCounter = nonExpressCounters[0]; // The first non-express counter is now the shortest
-
-            // Synchronize only the selected counter for more fine-grained control
-            synchronized (shortestQueueCounter) {
-                shortestQueueCounter.customerQueue.add(regularCustomer);
-                customersArrived++;
-                System.out.println("\nRegular Customer " + regularCustomer.getCustomerID() + " arrived at Counter " + shortestQueueCounter.getCounterNumber());
+            CashCounter expressCounter = counters[0];
+            synchronized (expressCounter) {
+                expressCounter.customerQueue.add(expressCustomer);
+                customersArrived.incrementAndGet();
+                System.out.println("\nExpress Customer " + expressCustomer.getCustomerID() + " arrived at Counter " + expressCounter.getCounterNumber());
             }
 
-            // Pause for the specified arrival rate before the next regular customer
             try {
                 Thread.sleep(pauseDuration);
             } catch (InterruptedException e) {
@@ -243,4 +227,26 @@ public class Simulation {
             }
         }
     }
+    
+    private static void printRegularArrivals(CashCounter[] counters, List<Customer> regularCustomers, int customerArrivalRate) {
+        long pauseDuration = customerArrivalRate * 1000;
+    
+        for (Customer regularCustomer : regularCustomers) {
+            CashCounter[] nonExpressCounters = Arrays.copyOfRange(counters, 1, counters.length);
+            Arrays.sort(nonExpressCounters, Comparator.comparingInt(c -> c.customerQueue.size()));
+            CashCounter shortestQueueCounter = nonExpressCounters[0];
+             
+            synchronized (shortestQueueCounter) {
+                shortestQueueCounter.customerQueue.add(regularCustomer);
+                customersArrived.incrementAndGet();
+                System.out.println("\nRegular Customer " + regularCustomer.getCustomerID() + " arrived at Counter " + shortestQueueCounter.getCounterNumber());
+            }
+
+            try {
+                Thread.sleep(pauseDuration);
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+        }
+    }           
 }
